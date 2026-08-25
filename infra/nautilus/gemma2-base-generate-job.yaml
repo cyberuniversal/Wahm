@@ -203,12 +203,12 @@ spec:
               cpu: "4"
               memory: 32Gi
               ephemeral-storage: 40Gi
-              nvidia.com/gpu: "1"
+              nvidia.com/a100: "1"
             limits:
               cpu: "4"
               memory: 32Gi
               ephemeral-storage: 40Gi
-              nvidia.com/gpu: "1"
+              nvidia.com/a100: "1"
           volumeMounts:
             - name: workspace
               mountPath: /workspace
