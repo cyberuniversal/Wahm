@@ -120,6 +120,18 @@ MODELS = {
         "notes": "Fanar's base — comparing Gemma vs Fanar directly tests what cultural alignment added",
     },
 
+    "gemma-2-9b-base": {
+        "model_id": "google/gemma-2-9b",
+        "display_name": "Gemma 2 9B Base",
+        "family": "multilingual",
+        "origin": "Google, USA",
+        "approach": "Primarily English-pretrained base checkpoint; no instruction tuning",
+        "size": "9B",
+        "base_url_env": "GEMMA2_BASE_URL",
+        "key_env": "GEMMA2_BASE_API_KEY",
+        "notes": "Exact base checkpoint used by Fanar; isolates post-training and cultural alignment effects",
+    },
+
     # ================================================================
     # GROUP 3: FRONTIER (closed-source, largest scale)
     # ================================================================

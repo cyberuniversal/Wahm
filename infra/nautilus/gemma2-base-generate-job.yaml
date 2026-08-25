@@ -1,0 +1,229 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: wahm-gemma2-base-generate
+  namespace: aiea-interns
+  labels:
+    app.kubernetes.io/name: wahm
+    wahm/stage: gemma2-base-generate
+spec:
+  activeDeadlineSeconds: 86400
+  backoffLimit: 2
+  podFailurePolicy:
+    rules:
+      - action: Ignore
+        onPodConditions:
+          - type: DisruptionTarget
+            status: "True"
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: wahm
+        wahm/stage: gemma2-base-generate
+    spec:
+      priorityClassName: opportunistic
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: generate
+          image: vllm/vllm-openai:v0.27.1
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              repo="/workspace/repos/wahm-${WAHM_GIT_COMMIT}"
+              if [[ ! -s "${repo}/generate.py" ]]; then
+                python3 - <<'PY'
+              import io, os, shutil, tarfile, urllib.request
+              from pathlib import Path
+
+              commit = os.environ['WAHM_GIT_COMMIT']
+              url = f'https://github.com/cyberuniversal/Wahm/archive/{commit}.tar.gz'
+              repo = Path('/workspace/repos') / f'wahm-{commit}'
+              with urllib.request.urlopen(url, timeout=120) as response:
+                  archive = response.read()
+              temp = Path('/tmp/wahm-source')
+              if temp.exists():
+                  shutil.rmtree(temp)
+              temp.mkdir()
+              with tarfile.open(fileobj=io.BytesIO(archive), mode='r:gz') as source:
+                  source.extractall(temp, filter='data')
+              extracted = next(temp.iterdir())
+              repo.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copytree(extracted, repo, dirs_exist_ok=True)
+              PY
+              fi
+              python3 - <<'PY'
+              import csv, hashlib, json, os
+              from pathlib import Path
+
+              repo = Path('/workspace/repos') / ('wahm-' + os.environ['WAHM_GIT_COMMIT'])
+              manifest = {
+                  'status': 'provisional_unreviewed_candidates',
+                  'input_commit': os.environ['WAHM_GIT_COMMIT'],
+                  'dialects': {},
+              }
+              for dialect in ('gulf', 'egyptian', 'levantine', 'sudanese'):
+                  source = repo / f'candidates_{dialect}.csv'
+                  raw = source.read_bytes()
+                  rows = list(csv.DictReader(raw.decode('utf-8-sig').splitlines()))
+                  target = repo / f'final_{dialect}.csv'
+                  with target.open('w', encoding='utf-8', newline='') as stream:
+                      writer = csv.DictWriter(
+                          stream,
+                          fieldnames=['qid', 'question_dialect', 'gold_answer'])
+                      writer.writeheader()
+                      for row in rows:
+                          writer.writerow({
+                              'qid': row['qid'],
+                              'question_dialect': row['dialect_candidate'],
+                              'gold_answer': row['gold_answer'],
+                          })
+                  manifest['dialects'][dialect] = {
+                      'rows': len(rows),
+                      'source': source.name,
+                      'source_sha256': hashlib.sha256(raw).hexdigest(),
+                  }
+              output = (Path('/workspace/results/wahm-generations') /
+                        os.environ['WAHM_OUTPUT_RUN'] / 'gemma2-base')
+              output.mkdir(parents=True, exist_ok=True)
+              manifest['model'] = {
+                  'id': os.environ['WAHM_GEMMA_MODEL'],
+                  'revision': os.environ['WAHM_GEMMA_REVISION'],
+                  'interface': 'openai_completions',
+                  'checkpoint_type': 'base_pretrained',
+                  'temperature': 0.0,
+              }
+              (output / 'input_manifest.json').write_text(
+                  json.dumps(manifest, indent=2, sort_keys=True) + '\n',
+                  encoding='utf-8')
+              PY
+              snapshot=$(python3 - <<'PY'
+              import os
+              from huggingface_hub import snapshot_download
+
+              print(snapshot_download(
+                  repo_id=os.environ['WAHM_GEMMA_MODEL'],
+                  revision=os.environ['WAHM_GEMMA_REVISION'],
+                  cache_dir='/model-cache',
+                  token=os.environ['HF_TOKEN'],
+                  allow_patterns=[
+                      '*.json', '*.model', '*.safetensors', '*.py',
+                      'LICENSE*', 'README.md',
+                  ],
+              ))
+              PY
+              )
+              test -d "${snapshot}"
+              export HF_HUB_OFFLINE=1
+              export TRANSFORMERS_OFFLINE=1
+              python3 -m vllm.entrypoints.openai.api_server \
+                --model "${snapshot}" \
+                --served-model-name "${WAHM_GEMMA_MODEL}" \
+                --host 127.0.0.1 \
+                --port 8000 \
+                --dtype bfloat16 \
+                --max-model-len 4096 \
+                --gpu-memory-utilization 0.90 \
+                --safetensors-load-strategy prefetch \
+                > /workspace/results/gemma2-base-vllm.log 2>&1 &
+              server_pid=$!
+              trap 'kill ${server_pid} 2>/dev/null || true' EXIT
+              python3 - <<'PY'
+              import time, urllib.request
+              for _ in range(1800):
+                  try:
+                      with urllib.request.urlopen('http://127.0.0.1:8000/health',
+                                                  timeout=2) as response:
+                          if response.status == 200:
+                              print('vLLM server ready')
+                              break
+                  except Exception:
+                      pass
+                  time.sleep(2)
+              else:
+                  raise SystemExit('vLLM server did not become ready')
+              PY
+              cd "${repo}"
+              python3 generate.py \
+                --models gemma-2-9b-base \
+                --varieties msa gulf egyptian levantine sudanese \
+                --conditions direct \
+                --temperature 0 \
+                --sleep 0 \
+                --workers 16
+              output="/workspace/results/wahm-generations/${WAHM_OUTPUT_RUN}/gemma2-base"
+              cp generations.csv "${output}/generations.csv"
+              python3 - <<'PY' | tee /dev/termination-log
+              import csv, hashlib, json, os
+              from collections import Counter
+              from pathlib import Path
+
+              path = (Path('/workspace/results/wahm-generations') /
+                      os.environ['WAHM_OUTPUT_RUN'] / 'gemma2-base/generations.csv')
+              raw = path.read_bytes()
+              rows = list(csv.DictReader(raw.decode('utf-8').splitlines()))
+              ok = [r for r in rows if r['answer'].strip() and not r['error'].strip()]
+              print(json.dumps({
+                  'output': str(path),
+                  'sha256': hashlib.sha256(raw).hexdigest(),
+                  'rows': len(rows),
+                  'successful': len(ok),
+                  'failed': len(rows) - len(ok),
+                  'successful_by_variety': dict(Counter(r['variety'] for r in ok)),
+                  'model': os.environ['WAHM_GEMMA_MODEL'],
+                  'model_revision': os.environ['WAHM_GEMMA_REVISION'],
+                  'checkpoint_type': 'base_pretrained',
+              }, sort_keys=True))
+              PY
+          env:
+            - name: WAHM_GIT_COMMIT
+              value: __WAHM_GIT_COMMIT__
+            - name: WAHM_OUTPUT_RUN
+              value: __WAHM_OUTPUT_RUN__
+            - name: WAHM_GEMMA_MODEL
+              value: google/gemma-2-9b
+            - name: WAHM_GEMMA_REVISION
+              value: 33c193028431c2fde6c6e51f29e6f17b60cbfac6
+            - name: GEMMA2_BASE_MODEL
+              value: google/gemma-2-9b
+            - name: GEMMA2_BASE_URL
+              value: http://127.0.0.1:8000/v1
+            - name: GEMMA2_BASE_API_KEY
+              value: local-vllm-no-auth
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: wahm-hf-token
+                  key: token
+            - name: HF_HOME
+              value: /model-cache
+          resources:
+            requests:
+              cpu: "4"
+              memory: 32Gi
+              ephemeral-storage: 40Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4"
+              memory: 32Gi
+              ephemeral-storage: 40Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: model-cache
+              mountPath: /model-cache
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: wahm-allam-539948
+        - name: model-cache
+          emptyDir:
+            sizeLimit: 35Gi
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi

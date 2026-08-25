@@ -263,6 +263,10 @@ class GenerationTests(unittest.TestCase):
                          "meta-llama/llama-3.3-70b-instruct")
         self.assertEqual(generate.MODELS["gemma-2-9b"]["model_id"],
                          "google/gemma-2-9b-it")
+        self.assertEqual(generate.MODELS["gemma-2-9b-base"]["model_id"],
+                         "google/gemma-2-9b")
+        self.assertEqual(generate.MODELS["gemma-2-9b-base"]["api_mode"],
+                         "completion")
 
     def test_qwen3_disables_thinking_mode(self):
         class Completions:

@@ -114,6 +114,14 @@ MODELS = {
         key_env="OPENROUTER_API_KEY",
         family="multilingual",
     ),
+    "gemma-2-9b-base": dict(
+        model_id=os.getenv("GEMMA2_BASE_MODEL", "google/gemma-2-9b"),
+        base_url=os.getenv(
+            "GEMMA2_BASE_URL", "http://127.0.0.1:8000/v1"),
+        key_env="GEMMA2_BASE_API_KEY",
+        family="multilingual",
+        api_mode="completion",
+    ),
 }
 
 VARIETIES = ["msa", "gulf", "egyptian", "levantine", "sudanese"]

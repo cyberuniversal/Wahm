@@ -1,0 +1,141 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: wahm-gemma2-base-score
+  namespace: aiea-interns
+  labels:
+    app.kubernetes.io/name: wahm
+    wahm/stage: gemma2-base-score
+spec:
+  activeDeadlineSeconds: 10800
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: wahm
+        wahm/stage: gemma2-base-score
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: score
+          image: pytorch/pytorch:2.7.1-cuda11.8-cudnn9-runtime
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              apt-get update
+              apt-get install -y --no-install-recommends git ca-certificates curl
+              rm -rf /var/lib/apt/lists/*
+              git clone "${WAHM_GIT_REPOSITORY}" /tmp/wahm
+              git -C /tmp/wahm checkout --detach "${WAHM_GIT_COMMIT}"
+              python -m pip install --no-cache-dir -r /tmp/wahm/requirements-judge.txt
+              run_dir="/results/results/wahm-generations/${WAHM_RUN_ID}/gemma2-base"
+              model_dir="/tmp/wahm/results/judge_v2_3411cf0"
+              curl --fail --location --retry 5 \
+                --output "${model_dir}/model.safetensors" \
+                "${WAHM_JUDGE_MODEL_URL}"
+              test -s "${run_dir}/generations.csv"
+              test -s "${model_dir}/model.safetensors"
+              test -s "${model_dir}/judge_metadata.json"
+              cd /tmp/wahm
+              python score_layer1.py \
+                --input "${run_dir}/generations.csv" \
+                --output "${run_dir}/scores_layer1.csv"
+              python score_layer2.py \
+                --input "${run_dir}/scores_layer1.csv" \
+                --model "${model_dir}" \
+                --output "${run_dir}/scores_combined.csv" \
+                --batch-size "${WAHM_BATCH_SIZE}"
+              python - <<'PY' | tee /dev/termination-log
+              import csv, hashlib, json, os
+              from collections import Counter
+              from pathlib import Path
+
+              run_dir = (Path('/results/results/wahm-generations') /
+                         os.environ['WAHM_RUN_ID'] / 'gemma2-base')
+              model_dir = Path('/tmp/wahm/results/judge_v2_3411cf0')
+              input_manifest = json.loads(
+                  (run_dir / 'input_manifest.json').read_text(encoding='utf-8'))
+              rows = list(csv.DictReader(
+                  (run_dir / 'scores_combined.csv').open(encoding='utf-8')))
+              counts = Counter(r['variety'] for r in rows)
+              expected = Counter({
+                  'msa': 300, 'gulf': 300, 'egyptian': 300,
+                  'levantine': 300, 'sudanese': 300})
+              if len(rows) != 1500 or counts != expected:
+                  raise SystemExit(f'unexpected evaluation rows: {len(rows)} {counts}')
+              deferred = sum(r['layer1_decision'] == 'defer' for r in rows)
+              layer2_scored = sum(bool(r['layer2_hallucination_probability'])
+                                  for r in rows)
+              if deferred != layer2_scored:
+                  raise SystemExit(
+                      f'Layer 2 coverage mismatch: {deferred=} {layer2_scored=}')
+              metadata_path = model_dir / 'judge_metadata.json'
+              weights_path = model_dir / 'model.safetensors'
+              summary = {
+                  'run_id': os.environ['WAHM_RUN_ID'],
+                  'input_commit': input_manifest['input_commit'],
+                  'score_commit': os.environ['WAHM_GIT_COMMIT'],
+                  'rows': len(rows),
+                  'rows_by_variety': dict(sorted(counts.items())),
+                  'layer1': dict(Counter(r['layer1_decision'] for r in rows)),
+                  'combined': dict(Counter(r['combined_decision'] for r in rows)),
+                  'combined_by_variety': {
+                      variety: dict(Counter(
+                          r['combined_decision'] for r in rows
+                          if r['variety'] == variety))
+                      for variety in sorted(counts)
+                  },
+                  'layer2_scored': layer2_scored,
+                  'layer2_threshold': 0.135,
+                  'layer2_run': '3411cf0-question-gold-answer',
+                  'judge_metadata_sha256': hashlib.sha256(
+                      metadata_path.read_bytes()).hexdigest(),
+                  'layer2_weights_sha256': hashlib.sha256(
+                      weights_path.read_bytes()).hexdigest(),
+                  'files': {},
+              }
+              for artifact in ('generations.csv', 'scores_layer1.csv',
+                               'scores_combined.csv', 'input_manifest.json'):
+                  path = run_dir / artifact
+                  raw = path.read_bytes()
+                  summary['files'][artifact] = {
+                      'bytes': len(raw),
+                      'sha256': hashlib.sha256(raw).hexdigest(),
+                  }
+              (run_dir / 'run_summary.json').write_text(
+                  json.dumps(summary, indent=2, sort_keys=True) + '\n',
+                  encoding='utf-8')
+              print(json.dumps(summary, sort_keys=True))
+              PY
+          env:
+            - name: WAHM_GIT_REPOSITORY
+              value: https://github.com/cyberuniversal/Wahm.git
+            - name: WAHM_GIT_COMMIT
+              value: __WAHM_GIT_COMMIT__
+            - name: WAHM_RUN_ID
+              value: __WAHM_OUTPUT_RUN__
+            - name: WAHM_JUDGE_MODEL_URL
+              value: https://github.com/cyberuniversal/Wahm/releases/download/judge-v2-3411cf0/model.safetensors
+            - name: WAHM_BATCH_SIZE
+              value: "64"
+            - name: OMP_NUM_THREADS
+              value: "16"
+            - name: TOKENIZERS_PARALLELISM
+              value: "false"
+            - name: WANDB_DISABLED
+              value: "true"
+          resources:
+            requests:
+              cpu: "16"
+              memory: 16Gi
+            limits:
+              cpu: "16"
+              memory: 16Gi
+          volumeMounts:
+            - name: results
+              mountPath: /results
+      volumes:
+        - name: results
+          persistentVolumeClaim:
+            claimName: wahm-allam-539948
