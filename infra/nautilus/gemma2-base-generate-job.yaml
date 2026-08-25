@@ -21,6 +21,14 @@ spec:
         app.kubernetes.io/name: wahm
         wahm/stage: gemma2-base-generate
     spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.memory
+                    operator: Gt
+                    values: ["32768"]
       priorityClassName: opportunistic
       restartPolicy: Never
       terminationGracePeriodSeconds: 120
@@ -203,12 +211,12 @@ spec:
               cpu: "4"
               memory: 32Gi
               ephemeral-storage: 40Gi
-              nvidia.com/a100: "1"
+              nvidia.com/gpu: "1"
             limits:
               cpu: "4"
               memory: 32Gi
               ephemeral-storage: 40Gi
-              nvidia.com/a100: "1"
+              nvidia.com/gpu: "1"
           volumeMounts:
             - name: workspace
               mountPath: /workspace
